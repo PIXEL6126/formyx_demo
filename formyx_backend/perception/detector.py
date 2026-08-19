@@ -4,6 +4,10 @@ formyx_backend/perception/detector.py
 Loads the YOLOv8 model and performs real-time object detection
 to locate balloon and drone targets in raw video frames.
 Supports fast ONNX Runtime inference on Raspberry Pi CPU.
+
+Optimised for **long-range** and **multi-target** scenarios via
+MultiScaleDetector (SAHI-style tiled inference with adaptive
+confidence thresholds).
 """
 
 from __future__ import annotations
@@ -201,14 +205,21 @@ class ONNXYoloDetector:
 
 class ObjectDetector:
     """
-    Dual-class object detector wrapper that matches the ObjectDetector interface expected
-    by the hardware testing session. It detects balloons (class 0) and drones (class 1)
-    using either optimized ONNX runtime sessions or PyTorch YOLO fallback.
+    Dual-class object detector wrapper that detects balloons (class 0) and
+    drones (class 1) using either:
+      • **OptimizedMultiScaleDetector** — SAHI-style tiled ONNX inference
+        with letterbox preprocessing and soft-NMS for high-confidence
+        long-range and multi-target detection (default when ONNX models exist)
+      • **PyTorch YOLO** — fallback when ONNX is unavailable
+
+    Constructor parameter *enable_tiled* enables/disables the tiled pass
+    (set ``False`` on very slow hardware to recover FPS).
     """
-    def __init__(self, model_path: str | None = None) -> None:
+    def __init__(self, model_path: str | None = None, enable_tiled: bool = True) -> None:
         cfg_path = model_path or get("perception", "model_path", "models/drone_balloon_detector.pt")
         self.model_path = Path(cfg_path)
         self.target_class_ids = {0, 1}
+        self.enable_tiled = enable_tiled
 
         # Resolve paths to balloon and drone models from config with defaults
         parent_dir = self.model_path.parent
@@ -226,9 +237,32 @@ class ObjectDetector:
                 self.use_onnx = True
             
         if self.use_onnx:
-            log.info("Initializing optimized ONNX Runtime inference sessions for CPU.")
-            self.balloon_detector = ONNXYoloDetector(str(self.balloon_onnx_path), conf_threshold=0.25)
-            self.drone_detector = ONNXYoloDetector(str(self.drone_onnx_path), conf_threshold=0.25)
+            from perception.optimized_detector import OptimizedMultiScaleDetector
+            log.info(
+                "Initialising OptimizedMultiScaleDetector (letterbox + soft-NMS, tiled=%s) "
+                "for high-confidence long-range + multi-target detection.",
+                self.enable_tiled,
+            )
+            self.balloon_detector = OptimizedMultiScaleDetector(
+                str(self.balloon_onnx_path),
+                conf_threshold=0.18,
+                conf_threshold_small=0.10,
+                iou_threshold=0.45,
+                small_box_area=900,
+                enable_tiled=self.enable_tiled,
+                tile_size=320,
+                tile_overlap=0.25,
+            )
+            self.drone_detector = OptimizedMultiScaleDetector(
+                str(self.drone_onnx_path),
+                conf_threshold=0.18,
+                conf_threshold_small=0.10,
+                iou_threshold=0.45,
+                small_box_area=900,
+                enable_tiled=self.enable_tiled,
+                tile_size=320,
+                tile_overlap=0.25,
+            )
         else:
             log.info("ONNX models not found or onnxruntime missing. Falling back to PyTorch YOLO.")
             # Check for PyTorch model files with fallback
@@ -268,7 +302,7 @@ class ObjectDetector:
                 })
             return detections
         else:
-            results = self.balloon_model(frame, imgsz=320, conf=0.25, device="cpu", verbose=False)
+            results = self.balloon_model(frame, imgsz=320, conf=0.15, device="cpu", verbose=False)
             detections = []
             for result in results:
                 if result.boxes is None:
@@ -307,7 +341,7 @@ class ObjectDetector:
                 })
             return detections
         else:
-            results = self.drone_model(frame, imgsz=320, conf=0.25, device="cpu", verbose=False)
+            results = self.drone_model(frame, imgsz=320, conf=0.15, device="cpu", verbose=False)
             detections = []
             for result in results:
                 if result.boxes is None:

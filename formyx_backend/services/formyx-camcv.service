@@ -1,5 +1,5 @@
 [Unit]
-Description=Formyx Camera Detection + Video Recorder (camcv)
+Description=Formyx Camera Detection + Video Recorder (camcv - Intel RealSense D435i USB 3.0)
 Documentation=file:///home/dart2/Formyx-master/formyx_backend/camcv.py
 # Start after the local filesystem is writable and udev has settled
 After=local-fs.target udev-settle.service
@@ -10,7 +10,7 @@ Type=simple
 User=dart2
 WorkingDirectory=/home/dart2/Formyx-master/formyx_backend
 
-# Wait for the UVC webcam (/dev/video0) to fully enumerate over USB 2.0
+# Wait for the Intel RealSense D435i camera to fully enumerate over USB 3.0
 ExecStartPre=/bin/sleep 6
 
 ExecStart=/usr/bin/python3 /home/dart2/Formyx-master/formyx_backend/camcv.py \

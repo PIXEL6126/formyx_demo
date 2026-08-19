@@ -1,16 +1,14 @@
 """
 formyx_backend/camcv.py
 -----------------------
-Standalone dual-class detection viewer + recorder.
+Standalone dual-class detection viewer + recorder with Intel RealSense D435i depth camera.
 
 Displays a live OpenCV window with balloon (red) and drone (green) detection
-overlays, FPS counter, and Kalman-tracker crosshair.
+overlays, FPS counter, metric depth measurement, and 3D Kalman-tracker crosshair.
 Every session is saved as a timestamped .mp4 in the camrec/ folder.
 
-NOTE: This version uses a standard UVC webcam via OpenCV VideoCapture
-      (USB 2.0 compatible, e.g. /dev/video0).  The Intel RealSense D435i
-      is NOT required — depth estimates are therefore unavailable and will
-      display as "N/A".
+NOTE: This version uses the Intel RealSense D435i depth camera connected over
+      USB 3.0 ports. Aligned RGB + Depth streams are acquired using pyrealsense2.
 
 Usage
 -----
@@ -19,13 +17,15 @@ Usage
 
 Options
 -------
-    --device INT        OpenCV camera device index (default: 0  → /dev/video0)
-    --width INT         Capture width  in pixels (default: 640)
+    --mock              Run in mock mode (simulated RealSense camera)
+    --width INT         Capture width in pixels (default: 640)
     --height INT        Capture height in pixels (default: 480)
     --conf FLOAT        Detection confidence threshold (default: 0.25)
     --interval INT      Run YOLO every N frames (default: 2, raise to 3 for
                         slower Pi boards)
     --no-tracker        Disable the Kalman tracker overlay
+    --no-tiled          Disable tiled (SAHI) inference (faster but worse
+                        long-range detection)
     --no-record         Stream only, do not save video
     --no-display        Headless mode — record without showing a window
     --output-dir PATH   Override recording directory (default: camrec)
@@ -48,8 +48,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from depth.realsense_interface import RealSenseInterface
 from perception.detector import ObjectDetector
-from tracking.target_tracker import TargetTracker
+from tracking.multi_target_tracker import MultiTargetTracker
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -66,7 +67,8 @@ log = logging.getLogger("camcv")
 # ---------------------------------------------------------------------------
 CLR_BALLOON  = (0,   0, 255)   # Red    — balloon
 CLR_DRONE    = (0, 220,   0)   # Green  — drone
-CLR_KF       = (0, 255, 255)   # Yellow — Kalman projection
+CLR_KF       = (0, 255, 255)   # Yellow — Kalman projection (primary target)
+CLR_KF_SEC   = (255, 200, 0)   # Cyan   — secondary tracked targets
 CLR_FPS      = (0, 255,   0)   # Green  — HUD text
 CLR_WHITE    = (255, 255, 255)
 CLR_BLACK    = (0,   0,   0)
@@ -78,10 +80,10 @@ CLR_BLACK    = (0,   0,   0)
 def _parse() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="camcv",
-        description="Formyx dual-class detection viewer + recorder (USB 2.0 UVC webcam)",
+        description="Formyx dual-class detection viewer + recorder (Intel RealSense D435i depth camera)",
     )
-    p.add_argument("--device",     type=int,   default=0,
-                   help="OpenCV camera device index (default 0 → /dev/video0)")
+    p.add_argument("--mock",       action="store_true",
+                   help="Run in mock mode with simulated RealSense camera")
     p.add_argument("--width",      type=int,   default=640,
                    help="Capture width in pixels (default 640)")
     p.add_argument("--height",     type=int,   default=480,
@@ -92,6 +94,8 @@ def _parse() -> argparse.Namespace:
                    help="Run YOLO every N frames (default 2)")
     p.add_argument("--no-tracker", action="store_true",
                    help="Disable the Kalman tracker overlay")
+    p.add_argument("--no-tiled",   action="store_true",
+                   help="Disable tiled/SAHI inference (faster, less long-range accuracy)")
     p.add_argument("--no-record",  action="store_true",
                    help="Do not save a video recording")
     p.add_argument("--no-display", action="store_true",
@@ -117,11 +121,12 @@ def _draw_box(img: np.ndarray, xmin: int, ymin: int, xmax: int, ymax: int,
 
 
 def _draw_hud(img: np.ndarray, fps: float, interval: int,
-              n_balloon: int, n_drone: int, tracking: bool) -> None:
+              n_balloon: int, n_drone: int, n_tracks: int,
+              tracking: bool) -> None:
     """Render the on-screen HUD (top-left corner)."""
     lines = [
         f"FPS: {fps:.1f}  |  interval: {interval}x",
-        f"Balloons: {n_balloon}   Drones: {n_drone}",
+        f"Balloons: {n_balloon}   Drones: {n_drone}   Tracks: {n_tracks}",
         f"Tracker: {'LOCKED' if tracking else 'SEARCHING'}",
     ]
     y = 28
@@ -134,42 +139,51 @@ def _draw_hud(img: np.ndarray, fps: float, interval: int,
         y += 26
 
 
-def _draw_kalman_2d(img: np.ndarray, tracker: TargetTracker) -> None:
+def _draw_kalman_tracks(img: np.ndarray, tracker: MultiTargetTracker,
+                        camera: RealSenseInterface) -> None:
     """
-    Overlay the Kalman tracker prediction.
-    With a plain webcam we have no depth — we treat the first two state
-    components (x, y) as pixel offsets from frame centre and render a cross.
-    The state is in camera-frame metres so we use a fixed nominal depth to
-    project back to pixels (intrinsics approximated from webcam field of view).
+    Overlay ALL confirmed 3D Kalman tracks using RealSense camera intrinsics.
+    Primary target → yellow crosshair, secondary → cyan markers.
     """
-    state = tracker.get_state()
-    if state is None:
-        return
-    px, py, pz, vx, vy, vz = state
-
-    # Approximate projection: assume ~60° HFOV at 640px → fx ≈ 554
-    fx = fy = 554.0
-    cx_px = img.shape[1] / 2
-    cy_px = img.shape[0] / 2
-
-    # Use pz if it looks like a plausible depth; else fall back to 1 m nominal
-    depth = max(pz, 0.5) if abs(pz) > 0.01 else 1.0
-    proj_x = int(px * fx / depth + cx_px)
-    proj_y = int(py * fy / depth + cy_px)
+    all_states = tracker.get_all_states()
+    primary = tracker.get_primary_target()
 
     h, w = img.shape[:2]
-    if not (0 <= proj_x < w and 0 <= proj_y < h):
-        return
 
-    cv2.drawMarker(img, (proj_x, proj_y), CLR_KF,
-                   cv2.MARKER_CROSS, markerSize=22, thickness=2)
-    label = f"KF  v=({vx:+.1f},{vy:+.1f})"
-    (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-    bx = min(proj_x + 12, w - tw - 4)
-    cv2.rectangle(img, (bx - 2, proj_y - 14), (bx + tw + 2, proj_y + 2),
-                  CLR_BLACK, -1)
-    cv2.putText(img, label, (bx, proj_y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, CLR_KF, 1, cv2.LINE_AA)
+    for info in all_states:
+        state = info["state"]
+        track_id = info["track_id"]
+        cls_id = info["class_id"]
+        px, py, pz, vx, vy, vz = state
+
+        if pz <= 0.05:
+            continue
+
+        proj_x = int(px * camera.fx / pz + camera.ppx)
+        proj_y = int(py * camera.fy / pz + camera.ppy)
+
+        if not (0 <= proj_x < w and 0 <= proj_y < h):
+            continue
+
+        # Determine if this is the primary target
+        is_primary = (primary is not None and
+                      abs(state[0] - primary[0]) < 1e-6 and
+                      abs(state[2] - primary[2]) < 1e-6)
+
+        color = CLR_KF if is_primary else CLR_KF_SEC
+        marker_sz = 22 if is_primary else 16
+
+        cv2.drawMarker(img, (proj_x, proj_y), color,
+                       cv2.MARKER_CROSS, markerSize=marker_sz, thickness=2)
+
+        cls_tag = "B" if cls_id == 0 else "D"
+        label = f"T{track_id}({cls_tag}) {pz:.1f}m v=({vx:+.1f},{vy:+.1f})"
+        (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+        bx = min(proj_x + 12, w - tw - 4)
+        cv2.rectangle(img, (bx - 2, proj_y - 14), (bx + tw + 2, proj_y + 2),
+                      CLR_BLACK, -1)
+        cv2.putText(img, label, (bx, proj_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1, cv2.LINE_AA)
 
 
 # ---------------------------------------------------------------------------
@@ -213,35 +227,33 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
 
     # ------------------------------------------------------------------
-    # 1. Open UVC webcam via OpenCV
+    # 1. Open Intel RealSense D435i camera
     # ------------------------------------------------------------------
-    log.info("Opening USB 2.0 UVC webcam at /dev/video%d …", args.device)
-    cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        log.error("Could not open /dev/video%d. Check that the camera is connected.", args.device)
-        return 1
+    log.info("Initialising Intel RealSense D435i depth camera (USB 3.0)…")
+    camera = RealSenseInterface(use_mock=args.mock)
+    camera.start()
+    if camera.is_mock:
+        log.warning("RealSense interface is running in MOCK mode.")
+    else:
+        log.info(
+            "RealSense camera ready — intrinsics: fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
+            camera.fx, camera.fy, camera.ppx, camera.ppy,
+        )
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    # Prefer MJPG codec — allows full 30fps on USB 2.0 bandwidth
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    log.info("Camera opened — resolution %dx%d", W, H)
+    W, H = 640, 480
 
     # ------------------------------------------------------------------
     # 2. Detector
     # ------------------------------------------------------------------
     log.info("Loading dual-class YOLO detector (balloon + drone)…")
-    detector = ObjectDetector()
-    log.info("Detector ready (ONNX=%s).", detector.use_onnx)
+    enable_tiled = not getattr(args, 'no_tiled', False)
+    detector = ObjectDetector(enable_tiled=enable_tiled)
+    log.info("Detector ready (ONNX=%s, tiled=%s).", detector.use_onnx, enable_tiled)
 
     # ------------------------------------------------------------------
-    # 3. Tracker (optional)
+    # 3. Multi-target tracker (optional)
     # ------------------------------------------------------------------
-    tracker = TargetTracker() if not args.no_tracker else None
+    tracker = MultiTargetTracker() if not args.no_tracker else None
 
     # ------------------------------------------------------------------
     # 4. Video writer
@@ -279,11 +291,13 @@ def main() -> int:
             run_yolo = (loop_idx % args.interval == 0)
 
             # --- grab frame -------------------------------------------
-            ret, color = cap.read()
-            if not ret or color is None:
-                log.warning("Failed to grab frame — retrying…")
+            frames = camera.get_frames()
+            if frames is None:
+                log.warning("Failed to grab frames from RealSense — retrying…")
                 time.sleep(0.05)
                 continue
+
+            color, depth = frames
 
             # --- YOLO inference ---------------------------------------
             n_balloon = n_drone = 0
@@ -294,22 +308,27 @@ def main() -> int:
                     xmin, ymin, xmax, ymax = map(int, det["bbox"])
                     cx = int((xmin + xmax) / 2)
                     cy = int((ymin + ymax) / 2)
+
+                    # Query robust metric distance at pixel centre
+                    dist = camera.get_distance_at_pixel(depth, cx, cy)
+
+                    rx, ry, rz = None, None, None
+                    if dist is not None:
+                        # Project 2D pixel + depth → 3D camera-frame coordinates (metres)
+                        rx = (cx - camera.ppx) * dist / camera.fx
+                        ry = (cy - camera.ppy) * dist / camera.fy
+                        rz = dist
+
                     last_dets.append({
                         **det,
                         "cx": cx, "cy": cy,
-                        "dist": None,  # No depth sensor available
+                        "dist": dist,
+                        "rx": rx, "ry": ry, "rz": rz,
                     })
-                    # Feed tracker with normalised pixel coords (no depth)
-                    # Map pixel to nominal camera-frame: assume 1 m depth
-                    if tracker:
-                        fx = fy = 554.0
-                        cx_c = W / 2
-                        cy_c = H / 2
-                        rx = (cx - cx_c) / fx
-                        ry = (cy - cy_c) / fy
-                        rz = 1.0  # nominal 1 m (no depth)
-                        tracker.predict(dt=1.0 / 30.0)
-                        tracker.update((rx, ry, rz))
+
+                # Feed ALL detections to multi-target tracker in one batch
+                if tracker:
+                    tracker.update(last_dets, dt=1.0 / 30.0)
             elif tracker:
                 tracker.predict(dt=1.0 / 30.0)
 
@@ -337,6 +356,7 @@ def main() -> int:
                     xmin, ymin, xmax, ymax = map(int, det["bbox"])
                     cx, cy  = det["cx"], det["cy"]
                     conf    = det["confidence"]
+                    dist    = det["dist"]
                     cls_id  = det["class_id"]
                     color_box = CLR_BALLOON if cls_id == 0 else CLR_DRONE
                     name      = "Balloon"   if cls_id == 0 else "Drone"
@@ -344,15 +364,18 @@ def main() -> int:
                         n_b += 1
                     else:
                         n_d += 1
+
+                    dist_str = f"{dist:.2f}m" if dist is not None else "N/A"
                     _draw_box(vis, xmin, ymin, xmax, ymax, color_box,
-                              f"{name}  {conf:.2f}  N/A")
+                              f"{name}  {conf:.2f}  {dist_str}")
                     cv2.circle(vis, (cx, cy), 4, CLR_KF, -1)
 
                 if tracker:
-                    _draw_kalman_2d(vis, tracker)
+                    _draw_kalman_tracks(vis, tracker, camera)
 
-                _draw_hud(vis, fps_display, args.interval, n_b, n_d,
-                          tracker.is_initialized if tracker else False)
+                n_tracks = len(tracker.confirmed_tracks) if tracker else 0
+                _draw_hud(vis, fps_display, args.interval, n_b, n_d, n_tracks,
+                          tracker.is_tracking if tracker else False)
 
                 # --- Write to recording ---------------------------
                 if writer and writer.isOpened():
@@ -380,6 +403,10 @@ def main() -> int:
                 except cv2.error:
                     break
 
+            # Throttling in mock mode to avoid tight loops
+            if camera.is_mock:
+                time.sleep(0.01)
+
     except KeyboardInterrupt:
         log.info("Interrupted.")
     finally:
@@ -387,10 +414,11 @@ def main() -> int:
         if writer and writer.isOpened():
             writer.release()
             log.info("Video saved → %s", rec_path)
-        cap.release()
-        cv2.destroyAllWindows()
-        for _ in range(5):
-            cv2.waitKey(1)
+        camera.stop()
+        if show_display:
+            cv2.destroyAllWindows()
+            for _ in range(5):
+                cv2.waitKey(1)
         log.info("Done.")
 
     return 0

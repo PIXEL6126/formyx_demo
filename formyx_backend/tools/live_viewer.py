@@ -11,7 +11,7 @@ Keys:
     Q  — quit
 """
 
-import sys, os
+import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import cv2
@@ -40,6 +40,10 @@ def main():
     cv2.namedWindow("Formyx — RealSense Live View", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Formyx — RealSense Live View", 1280, 520)
 
+    fps_display = 0.0
+    frame_count = 0
+    start_time = time.time()
+
     try:
         while True:
             frames        = pipeline.wait_for_frames(timeout_ms=5000)
@@ -54,6 +58,20 @@ def main():
             depth_coloured = np.asanyarray(
                 colorizer.colorize(depth_frame).get_data()
             )
+
+            # Calculate FPS
+            frame_count += 1
+            curr_time = time.time()
+            elapsed = curr_time - start_time
+            if elapsed >= 1.0:
+                fps_display = frame_count / elapsed
+                frame_count = 0
+                start_time = curr_time
+
+            # Overlay FPS counter on color image
+            fps_label = f"FPS: {fps_display:.1f}"
+            cv2.putText(color_img, fps_label, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
             # Overlay centre-pixel distance on depth frame
             dist = depth_frame.get_distance(320, 240)

@@ -32,15 +32,25 @@ safety:
   heartbeat_loss_timeout_s: 3.0   # Trigger failsafe if heartbeat lost
 
 perception:
-  model_path: "models/balloon_detector.pt"   # Path to YOLOv8 .pt file
+  model_path: "models/yolo11n_balloon.pt"     # Primary detection model
   drone_model_path: "models/yolo11n_drone.pt"
   balloon_model_path: "models/yolo11n_balloon.pt"
-  confidence_threshold: 0.60                  # Minimum detection confidence
+  confidence_threshold: 0.50                  # Minimum detection confidence
   inference_resolution: [320, 320]            # [width, height] for inference
   target_class_id: 0                          # YOLO class ID for 'balloon'
   class_mappings:
     balloon: 0
     drone: 1
+  # Multi-scale / tiled inference (SAHI-style) for long-range targets
+  # Now using OptimizedMultiScaleDetector with letterbox preprocessing
+  # and soft-NMS for higher confidence retention
+  tiled_inference: true                       # Enable tiled sliding-window pass
+  conf_threshold_normal: 0.18                 # Confidence for normal-sized detections
+  conf_threshold_small: 0.10                  # Lower confidence for tiny/far targets
+  small_box_area_px: 900                      # Boxes < 30×30px get the lower threshold
+  tile_size: 320                              # Tile dimensions (pixels)
+  tile_overlap: 0.25                          # Fractional overlap between tiles
+
 
 depth:
   # Patch averaging window (pixels) for depth shadow mitigation
@@ -54,6 +64,8 @@ tracking:
   mahalanobis_gate_distance: 9.21   # chi-squared 99th percentile (3-DOF)
   max_lost_frames: 30               # Frames before tracker is dropped
   target_lost_timeout_s: 2.0        # Seconds before switching to recovery
+  velocity_damping: 0.1             # Velocity decay rate during coast (prevents drift)
+  association_gate_m: 3.0           # Max 3D Euclidean distance for track-detection matching
 
 navigation:
   max_horizontal_speed_ms: 3.0    # m/s cap for follow commands

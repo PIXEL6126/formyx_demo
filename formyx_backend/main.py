@@ -42,7 +42,7 @@ import numpy as np
 from config import load_config, get
 from depth.realsense_interface import RealSenseInterface
 from perception.detector import ObjectDetector
-from tracking.target_tracker import TargetTracker
+from tracking.multi_target_tracker import MultiTargetTracker
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +136,11 @@ def _parse_args() -> argparse.Namespace:
         help="Disable saving video recording",
     )
     parser.add_argument(
+        "--no-tiled",
+        action="store_true",
+        help="Disable tiled/SAHI inference (faster, less long-range accuracy)",
+    )
+    parser.add_argument(
         "--output-dir",
         default="camrec",
         help="Directory to save recorded videos (default: camrec)",
@@ -219,13 +224,14 @@ def main() -> int:
     # 3. Perception — dual-class ONNX detector
     # ------------------------------------------------------------------
     log.info("Loading dual-class YOLO detector (balloon + drone)...")
-    detector = ObjectDetector()
-    log.info("Detector ready (ONNX=%s).", detector.use_onnx)
+    enable_tiled = not getattr(args, 'no_tiled', False)
+    detector = ObjectDetector(enable_tiled=enable_tiled)
+    log.info("Detector ready (ONNX=%s, tiled=%s).", detector.use_onnx, enable_tiled)
 
     # ------------------------------------------------------------------
-    # 4. 3D Kalman tracker
+    # 4. Multi-target 3D Kalman tracker
     # ------------------------------------------------------------------
-    tracker = TargetTracker()
+    tracker = MultiTargetTracker()
 
     # ------------------------------------------------------------------
     # 5. BlackBox logger
@@ -301,9 +307,8 @@ def main() -> int:
                         "rx": rx, "ry": ry, "rz": rz,
                     })
 
-                    # Feed into Kalman tracker
-                    tracker.predict(dt=1.0 / 30.0)
-                    tracker.update((rx, ry, rz))
+                # Feed ALL detections to multi-target tracker in one batch
+                tracker.update(last_detections, dt=1.0 / 30.0)
             else:
                 # Between YOLO frames, propagate the Kalman prediction only
                 tracker.predict(dt=1.0 / 30.0)
@@ -324,8 +329,9 @@ def main() -> int:
             else:
                 telemetry = TelemetrySnapshot(connected=False)
 
-            target_vector = tracker.get_state()
-            trk_status = "TRACKING" if tracker.is_initialized else "SEARCHING"
+            target_vector = tracker.get_primary_target()
+            trk_status = "TRACKING" if tracker.is_tracking else "SEARCHING"
+            n_active_tracks = len(tracker.confirmed_tracks)
 
             if now - last_log_time >= (1.0 / 10.0):
                 logger.log(
@@ -360,25 +366,35 @@ def main() -> int:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
                     cv2.circle(annotated, (cx, cy), 4, (0, 255, 255), -1)
 
-                # Kalman tracker overlay
-                if target_vector is not None:
-                    px, py, pz, vx, vy, vz = target_vector
-                    # Project 3D state back to pixel for display
+                # Kalman tracker overlay — draw ALL confirmed tracks
+                all_track_states = tracker.get_all_states()
+                primary_state = tracker.get_primary_target()
+                for tinfo in all_track_states:
+                    tstate = tinfo["state"]
+                    t_id = tinfo["track_id"]
+                    t_cls = tinfo["class_id"]
+                    px, py, pz, vx, vy, vz = tstate
                     if pz > 0:
                         proj_x = int(px * camera.fx / pz + camera.ppx)
                         proj_y = int(py * camera.fy / pz + camera.ppy)
                         if 0 <= proj_x < 640 and 0 <= proj_y < 480:
+                            is_primary = (primary_state is not None and
+                                          abs(tstate[0] - primary_state[0]) < 1e-6 and
+                                          abs(tstate[2] - primary_state[2]) < 1e-6)
+                            clr = (0, 255, 255) if is_primary else (255, 200, 0)
+                            sz = 20 if is_primary else 14
                             cv2.drawMarker(annotated, (proj_x, proj_y),
-                                           (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
-                            kf_label = f"KF ({pz:.2f}m) v={vz:.1f}m/s"
+                                           clr, cv2.MARKER_CROSS, sz, 2)
+                            cls_tag = "B" if t_cls == 0 else "D"
+                            kf_label = f"T{t_id}({cls_tag}) {pz:.1f}m v={vz:.1f}"
                             cv2.putText(annotated, kf_label, (proj_x + 10, proj_y),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, clr, 1, cv2.LINE_AA)
 
                 # FPS + tracker status overlay
                 cv2.putText(
                     annotated,
-                    f"FPS: {fps_display:.1f}  Interval: {inference_interval}x  [{trk_status}]",
-                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA,
+                    f"FPS: {fps_display:.1f}  Interval: {inference_interval}x  Tracks: {n_active_tracks}  [{trk_status}]",
+                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA,
                 )
 
                 # Write to video

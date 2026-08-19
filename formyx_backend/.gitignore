@@ -22,17 +22,31 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
-*.log
 
-# Logs from flight sessions
+# Runtime logs
+*.log
 logs/
 *.jsonl
 
 # ML model weights (large files — store with Git LFS or separately)
-models/
+models/*.pt
+models/*.onnx
 *.pt
 *.onnx
 *.tflite
+
+# Training runs and dataset (large, generated)
+training/balloon_dataset
+runs/
+
+# Video recordings (generated at runtime)
+camrec/
+
+# Evaluation results (generated)
+eval_results/
+
+# Scratch/temp files
+scratch/
 
 # IDE
 .vscode/
