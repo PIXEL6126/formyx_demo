@@ -1,0 +1,47 @@
+=================================================================
+  FORMYX BALLOON/DRONE DETECTION — MODEL EVALUATION REPORT
+=================================================================
+
+  Videos evaluated:       3
+  Total frames sampled:   90
+  Models:                 yolo11n_balloon_320.onnx + yolo11n_drone_320.onnx
+
+─────────────────────────────────────────────────────────────────
+  SINGLE-PASS (320×320, old pipeline)
+─────────────────────────────────────────────────────────────────
+  Total detections:       5
+  Avg detections/frame:   0.06
+  Small detections (<900px²): 0
+  Avg confidence:         0.298
+  Avg latency:            109.3 ms
+  Avg FPS:                9.2
+  P50 / P95 / P99 lat:   108.3 / 122.8 / 126.0 ms
+
+─────────────────────────────────────────────────────────────────
+  TILED / SAHI (multi-scale, new pipeline)
+─────────────────────────────────────────────────────────────────
+  Total detections:       96
+  Avg detections/frame:   1.07
+  Small detections (<900px²): 49
+  Avg confidence:         0.385
+  Avg latency:            732.0 ms
+  Avg FPS:                1.4
+  P50 / P95 / P99 lat:   723.9 / 782.4 / 874.2 ms
+
+─────────────────────────────────────────────────────────────────
+  IMPROVEMENT
+─────────────────────────────────────────────────────────────────
+  Detection count gain:   +91 (+1820.0%)
+  Small-target gain:      +49 more small detections
+  FPS cost:               -7.8 FPS
+
+=================================================================
+  Output files:
+    /home/dart2/Formyx-master/formyx_backend/eval_results/detection_log.csv
+    /home/dart2/Formyx-master/formyx_backend/eval_results/fps_comparison.png
+    /home/dart2/Formyx-master/formyx_backend/eval_results/detection_counts.png
+    /home/dart2/Formyx-master/formyx_backend/eval_results/confidence_distribution.png
+    /home/dart2/Formyx-master/formyx_backend/eval_results/size_distribution.png
+    /home/dart2/Formyx-master/formyx_backend/eval_results/latency_percentiles.png
+    /home/dart2/Formyx-master/formyx_backend/eval_results/sample_frames  (15 images)
+=================================================================

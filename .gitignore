@@ -1,4 +1,3 @@
 # Formyx Root Gitignore
-*.pt
-*.onnx
-formyx_backend/camrec/
+__pycache__/
+
